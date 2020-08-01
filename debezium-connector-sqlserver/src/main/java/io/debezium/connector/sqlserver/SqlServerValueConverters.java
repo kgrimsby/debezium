@@ -12,6 +12,8 @@ import java.time.ZoneOffset;
 
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.SchemaBuilder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import io.debezium.data.SpecialValueDecimal;
 import io.debezium.jdbc.JdbcValueConverters;
@@ -29,6 +31,7 @@ import microsoft.sql.DateTimeOffset;
  *
  */
 public class SqlServerValueConverters extends JdbcValueConverters {
+    private static Logger LOGGER = LoggerFactory.getLogger(SqlServerValueConverters.class);
 
     public SqlServerValueConverters() {
     }
@@ -53,12 +56,20 @@ public class SqlServerValueConverters extends JdbcValueConverters {
 
     @Override
     public SchemaBuilder schemaBuilder(Column column) {
+        if (column.typeName().equals("uniqueidentifier")) {
+            LOGGER.info("!!!!Returning parameter uuid");
+            return super.schemaBuilder(column).parameter("uuid", "yes");
+        }
+
         switch (column.jdbcType()) {
             // Numeric integers
             case Types.TINYINT:
                 // values are an 8-bit unsigned integer value between 0 and 255, we thus need to store it in short int
                 return SchemaBuilder.int16();
+            case Types.OTHER:
+                LOGGER.info("Found OTHER: {}", column.typeName());
 
+                return super.schemaBuilder(column);
             // Floating point
             case microsoft.sql.Types.SMALLMONEY:
             case microsoft.sql.Types.MONEY:
