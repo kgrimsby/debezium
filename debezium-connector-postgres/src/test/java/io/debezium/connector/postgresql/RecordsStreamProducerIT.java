@@ -1560,6 +1560,7 @@ public class RecordsStreamProducerIT extends AbstractRecordsProducerTest {
         // the low heartbeat interval should make sure that a heartbeat message is emitted after each change record
         // received from Postgres
         startConnector(config -> config.with(Heartbeat.HEARTBEAT_INTERVAL, "100"));
+        waitForStreamingToStart();
 
         TestHelper.execute(
                 "DROP TABLE IF EXISTS test_table;" +
@@ -1572,19 +1573,31 @@ public class RecordsStreamProducerIT extends AbstractRecordsProducerTest {
             return record != null && Envelope.isEnvelopeSchema(record.valueSchema());
         });
 
+        // Wait for heartbeat that is emitted after the data change
+        // This is necessary to make sure that timing does not influence the lsn count check
+        final Set<Long> lsns = new HashSet<>();
+        Awaitility.await().atMost(TestHelper.waitTimeForRecords() * 10, TimeUnit.SECONDS).until(() -> {
+            final SourceRecord record = consumeRecord();
+            if (record == null) {
+                return false;
+            }
+            Assertions.assertThat(record.valueSchema().name()).endsWith(".Heartbeat");
+            lsns.add((Long) record.sourceOffset().get("lsn"));
+            return true;
+        });
+
         // Expecting one empty DDL change
         String statement = "CREATE SCHEMA s1;";
 
         TestHelper.execute(statement);
 
         // Expecting changes for the empty DDL change
-        final Set<Long> lsns = new HashSet<>();
         Awaitility.await().atMost(TestHelper.waitTimeForRecords() * 10, TimeUnit.SECONDS).until(() -> {
             final SourceRecord record = consumeRecord();
             Assertions.assertThat(record.valueSchema().name()).endsWith(".Heartbeat");
             lsns.add((Long) record.sourceOffset().get("lsn"));
             // CREATE SCHEMA should change LSN
-            return lsns.size() > 1;
+            return lsns.size() == 2;
         });
         assertThat(consumer.isEmpty()).isTrue();
     }

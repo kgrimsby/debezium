@@ -8,31 +8,35 @@ package io.debezium.connector.sqlserver.util;
 
 import java.lang.management.ManagementFactory;
 import java.nio.file.Path;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
 import javax.management.InstanceNotFoundException;
 import javax.management.MBeanServer;
+import javax.management.MalformedObjectNameException;
 import javax.management.ObjectName;
 
 import org.awaitility.Awaitility;
 import org.awaitility.core.ConditionTimeoutException;
-import org.junit.Assert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.config.Configuration;
+import io.debezium.connector.sqlserver.Lsn;
 import io.debezium.connector.sqlserver.SourceTimestampMode;
+import io.debezium.connector.sqlserver.SqlServerChangeTable;
 import io.debezium.connector.sqlserver.SqlServerConnection;
 import io.debezium.connector.sqlserver.SqlServerConnectorConfig;
 import io.debezium.jdbc.JdbcConfiguration;
+import io.debezium.jdbc.JdbcConnection;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
 import io.debezium.relational.history.FileDatabaseHistory;
 import io.debezium.util.Clock;
 import io.debezium.util.IoUtil;
-import io.debezium.util.Metronome;
 import io.debezium.util.Testing;
 
 /**
@@ -303,33 +307,131 @@ public class TestHelper {
         connection.execute(disableCdcForTableStmt);
     }
 
-    public static void waitForSnapshotToBeCompleted() throws InterruptedException {
-        int waitForSeconds = 60;
+    public static void waitForSnapshotToBeCompleted() {
         final MBeanServer mbeanServer = ManagementFactory.getPlatformMBeanServer();
-        final Metronome metronome = Metronome.sleeper(Duration.ofSeconds(1), Clock.system());
-
-        while (true) {
-            if (waitForSeconds-- <= 0) {
-                Assert.fail("Snapshot was not completed on time");
-            }
-            try {
-                final boolean completed = (boolean) mbeanServer.getAttribute(new ObjectName("debezium.sql_server:type=connector-metrics,context=snapshot,server=server1"),
-                        "SnapshotCompleted");
-                if (completed) {
-                    break;
+        try {
+            Awaitility.await("Snapshot not completed").atMost(Duration.ofSeconds(60)).until(() -> {
+                try {
+                    return (boolean) mbeanServer.getAttribute(getObjectName("snapshot", "server1"), "SnapshotCompleted");
                 }
-            }
-            catch (InstanceNotFoundException e) {
-                // Metrics has not started yet
-            }
-            catch (Exception e) {
-                throw new IllegalStateException(e);
-            }
-            metronome.pause();
+                catch (InstanceNotFoundException e) {
+                    // Metrics has not started yet
+                    return false;
+                }
+            });
         }
+        catch (ConditionTimeoutException e) {
+            throw new IllegalArgumentException("Snapshot did not complete", e);
+        }
+    }
+
+    public static void waitForStreamingStarted() {
+        final MBeanServer mbeanServer = ManagementFactory.getPlatformMBeanServer();
+        try {
+            Awaitility.await("Streaming never started").atMost(Duration.ofSeconds(60)).until(() -> {
+                try {
+                    return (boolean) mbeanServer.getAttribute(getObjectName("streaming", "server1"), "Connected");
+                }
+                catch (InstanceNotFoundException e) {
+                    // Metrics has not started yet
+                    return false;
+                }
+            });
+        }
+        catch (ConditionTimeoutException e) {
+            throw new IllegalArgumentException("Streaming did not start", e);
+        }
+    }
+
+    private static ObjectName getObjectName(String context, String serverName) throws MalformedObjectNameException {
+        return new ObjectName("debezium.sql_server:type=connector-metrics,context=" + context + ",server=" + serverName);
     }
 
     public static int waitTimeForRecords() {
         return Integer.parseInt(System.getProperty(TEST_PROPERTY_PREFIX + "records.waittime", "5"));
+    }
+
+    /**
+     * Utility method that will poll the CDC change tables and provide the record handler with the changes detected.
+     * The record handler can then make a determination as to whether to return {@code true} if the expected outcome
+     * exists or {@code false} to indicate it did not find what it expected.  This method will block until either
+     * the handler returns {@code true} or if the polling fails to complete within the allocated poll window.
+     *
+     * @param connection the SQL Server connection to be used
+     * @param tableName the main table name to be checked
+     * @param handler the handler method to be called if changes are found in the capture table instance
+     */
+    public static void waitForCdcRecord(SqlServerConnection connection, String tableName, CdcRecordHandler handler) {
+        try {
+            Awaitility.await("Checking for expected record in CDC table for " + tableName)
+                    .atMost(30, TimeUnit.SECONDS)
+                    .pollDelay(Duration.ofSeconds(0))
+                    .pollInterval(Duration.ofMillis(100)).until(() -> {
+                        if (!connection.getMaxLsn().isAvailable()) {
+                            return false;
+                        }
+
+                        for (SqlServerChangeTable ct : connection.listOfChangeTables()) {
+                            final String ctTableName = ct.getChangeTableId().table();
+                            if (ctTableName.endsWith("dbo_" + connection.getNameOfChangeTable(tableName))) {
+                                try {
+                                    final Lsn minLsn = connection.getMinLsn(ctTableName);
+                                    final Lsn maxLsn = connection.getMaxLsn();
+                                    final CdcRecordFoundBlockingMultiResultSetConsumer consumer = new CdcRecordFoundBlockingMultiResultSetConsumer(handler);
+                                    SqlServerChangeTable[] tables = Collections.singletonList(ct).toArray(new SqlServerChangeTable[]{});
+                                    connection.getChangesForTables(tables, minLsn, maxLsn, consumer);
+                                    return consumer.isFound();
+                                }
+                                catch (Exception e) {
+                                    if (e.getMessage().contains("An insufficient number of arguments were supplied")) {
+                                        // This can happen if the request to get changes for tables happens too quickly.
+                                        // In this case, we're going to ignore it.
+                                        return false;
+                                    }
+                                    throw new AssertionError("Failed to fetch changes for " + tableName, e);
+                                }
+                            }
+                        }
+                        return false;
+                    });
+        }
+        catch (ConditionTimeoutException e) {
+            throw new IllegalStateException("Expected record never appeared in the CDC table", e);
+        }
+    }
+
+    @FunctionalInterface
+    public interface CdcRecordHandler {
+        boolean apply(ResultSet rs) throws SQLException;
+    }
+
+    /**
+     * A multiple result-set consumer used internally by {@link #waitForCdcRecord(SqlServerConnection, String, CdcRecordHandler)}
+     * that allows returning whether the provided {@link CdcRecordHandler} detected the expected condition or not.
+     */
+    static class CdcRecordFoundBlockingMultiResultSetConsumer implements JdbcConnection.BlockingMultiResultSetConsumer {
+        private final CdcRecordHandler handler;
+        private boolean found;
+
+        public CdcRecordFoundBlockingMultiResultSetConsumer(CdcRecordHandler handler) {
+            this.handler = handler;
+        }
+
+        @Override
+        public void accept(ResultSet[] rs) throws SQLException, InterruptedException {
+            if (rs.length == 1) {
+                final ResultSet resultSet = rs[0];
+                while (resultSet.next()) {
+                    if (handler.apply(resultSet)) {
+                        this.found = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        public boolean isFound() {
+            return found;
+        }
     }
 }
